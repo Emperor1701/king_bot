@@ -297,6 +297,11 @@ class PublishStates(StatesGroup):
 
 pending_names: Dict[Tuple[int,int,int], bool] = {}
 
+# ---------------------- Numbering helper (up to 10 options) ----------------------
+CIRCLED = ["①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩"]
+def circ_num(idx: int) -> str:
+    return CIRCLED[idx] if 0 <= idx < len(CIRCLED) else f"{idx+1})"
+
 # ---------------------- Keyboards ----------------------
 def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
     rows = [
@@ -390,7 +395,7 @@ def build_options_kb(question_id:int, target_user_id:int) -> InlineKeyboardMarku
     rows = options_for_question(question_id)
     kb = InlineKeyboardBuilder()
     for r in rows:
-        idx = r['option_index']; text = r['text']; circ = chr(0x2776 + idx)
+        idx = int(r['option_index']); text = r['text']; circ = circ_num(idx)
         kb.button(text=f"{circ} {text}", callback_data=f"ans:{question_id}:{idx}:{target_user_id}")
     kb.adjust(1)
     return kb.as_markup()
@@ -411,7 +416,7 @@ def question_card_text(qrow:sqlite3.Row) -> str:
     if opts:
         lines.append("الخيارات:")
         for r in opts:
-            circ = chr(0x2776 + int(r["option_index"]))
+            circ = circ_num(int(r["option_index"]))
             mark = " ✅" if int(r["is_correct"])==1 else ""
             lines.append(f"{circ} {r['text']}{mark}")
     else:
@@ -533,7 +538,7 @@ async def receive_title(msg: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("bund_pickq_page:"))
 async def bundles_page(cb:CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(int(page),"bund_pickq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page),"bund_pickq"))
 
 @dp.callback_query(F.data.startswith("bund_pickq:"), BundleStates.waiting_pick_quiz_for_bundle)
 async def bundles_for_quiz(cb:CallbackQuery, state:FSMContext):
@@ -576,7 +581,7 @@ async def bundle_add_file(msg:Message, state:FSMContext):
 @dp.callback_query(F.data.startswith("pick_for_addq_page:"))
 async def page_pick_for_addq(cb:CallbackQuery, state: FSMContext):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(page=int(page), tag="pick_for_addq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(page=int(page), tag="pick_for_addq"))
 
 @dp.callback_query(F.data.startswith("pick_for_addq:"))
 async def picked_quiz_for_addq(cb: CallbackQuery, state: FSMContext):
@@ -617,12 +622,12 @@ async def choose_attach_mode(cb:CallbackQuery, state:FSMContext):
         await cb.message.edit_text("أرسل حتى 5 مرفقات لهذا السؤال. عند الانتهاء اكتب <b>تم</b>.")
     else:
         await state.set_state(BuildStates.waiting_options_count)
-        await cb.message.edit_text("كم عدد الخيارات؟ (2-8)")
+        await cb.message.edit_text("كم عدد الخيارات؟ (2-10)")
 
 @dp.callback_query(F.data.startswith("pickbundle_for_q_page:"), BuildStates.waiting_pick_bundle_for_q)
 async def page_pickbundle_q(cb:CallbackQuery, state:FSMContext):
     _, quiz_id, page = cb.data.split(":",2)
-    await cb.message.edit_reply_markup(paged_bundles_kb(int(quiz_id), int(page), "pickbundle_for_q"))
+    await cb.message.edit_reply_markup(reply_markup=paged_bundles_kb(int(quiz_id), int(page), "pickbundle_for_q"))
 
 @dp.callback_query(F.data.startswith("pickbundle_for_q:"), BuildStates.waiting_pick_bundle_for_q)
 async def picked_bundle_for_q(cb:CallbackQuery, state:FSMContext):
@@ -635,14 +640,14 @@ async def picked_bundle_for_q(cb:CallbackQuery, state:FSMContext):
         conn.execute("UPDATE questions SET media_bundle_id=? WHERE id=?", (bundle_id, build_session.tmp_question_id))
         conn.commit()
     await state.set_state(BuildStates.waiting_options_count)
-    await cb.message.edit_text("تم الربط بالحزمة.\nكم عدد الخيارات؟ (2-8)")
+    await cb.message.edit_text("تم الربط بالحزمة.\nكم عدد الخيارات؟ (2-10)")
 
 @dp.message(BuildStates.waiting_q_attachments, F.text)
 async def finish_attachments_if_text(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): await state.clear(); return
     if (msg.text or "").strip().lower() == "تم":
         await state.set_state(BuildStates.waiting_options_count)
-        await msg.answer("كم عدد الخيارات؟ (2-8)", reply_markup=owner_panel_reply_kb())
+        await msg.answer("كم عدد الخيارات؟ (2-10)", reply_markup=owner_panel_reply_kb())
     else:
         await msg.reply("أرسل مرفق أو اكتب <b>تم</b> للمتابعة.")
 
@@ -670,9 +675,9 @@ async def receive_options_count(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): await state.clear(); return
     try:
         n = int(msg.text.strip())
-        if n < 2 or n > 8: raise ValueError
+        if n < 2 or n > 10: raise ValueError
     except ValueError:
-        return await msg.reply("أدخل رقمًا بين 2 و 8.")
+        return await msg.reply("أدخل رقمًا بين 2 و 10.")
     build_session.options_needed = n
     build_session.options_collected = 0
     await state.set_state(BuildStates.waiting_option_text)
@@ -713,7 +718,7 @@ async def receive_correct_index(msg: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("listq_pickq_page:"), BuildStates.waiting_pick_quiz_generic)
 async def cb_list_questions_page(cb: CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(page=int(page), tag="listq_pickq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(page=int(page), tag="listq_pickq"))
 
 @dp.callback_query(F.data.startswith("listq_pickq:"), BuildStates.waiting_pick_quiz_generic)
 async def cb_list_questions_show(cb: CallbackQuery, state:FSMContext):
@@ -725,7 +730,7 @@ async def cb_list_questions_show(cb: CallbackQuery, state:FSMContext):
 @dp.callback_query(F.data.startswith("manageq_page:"), BuildStates.waiting_manage_question_pick)
 async def cb_manageq_page(cb:CallbackQuery, state:FSMContext):
     _, quiz_id, page = cb.data.split(":",2)
-    await cb.message.edit_reply_markup(paged_questions_kb(int(quiz_id), int(page), tag="manageq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_questions_kb(int(quiz_id), int(page), tag="manageq"))
 
 @dp.callback_query(F.data.startswith("manageq:"), BuildStates.waiting_manage_question_pick)
 async def cb_manageq_open(cb:CallbackQuery, state:FSMContext):
@@ -760,16 +765,16 @@ async def cb_m_edit_opts(cb:CallbackQuery, state:FSMContext):
     _, quiz_id, qid, page = cb.data.split(":",3)
     await state.update_data(quiz_id=int(quiz_id), question_id=int(qid), page=int(page))
     await state.set_state(EditOptionStates.waiting_count)
-    await cb.message.edit_text("أدخل عدد الخيارات الجديد (2-8):")
+    await cb.message.edit_text("أدخل عدد الخيارات الجديد (2-10):")
 
 @dp.message(EditOptionStates.waiting_count, F.text)
 async def m_opts_count(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): await state.clear(); return
     try:
         n = int(msg.text.strip()); 
-        if n<2 or n>8: raise ValueError
+        if n<2 or n>10: raise ValueError
     except ValueError:
-        return await msg.reply("أدخل رقمًا بين 2 و 8.")
+        return await msg.reply("أدخل رقمًا بين 2 و 10.")
     await state.update_data(n=n, i=0)
     await state.set_state(EditOptionStates.waiting_text)
     await msg.answer("أرسل نص الخيار 1:", reply_markup=owner_panel_reply_kb())
@@ -857,7 +862,7 @@ async def cb_m_delete(cb:CallbackQuery):
 @dp.callback_query(F.data.startswith("overview_q_page:"))
 async def cb_list_quizzes_page(cb: CallbackQuery):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(page=int(page), tag="overview_q"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(page=int(page), tag="overview_q"))
 
 @dp.callback_query(F.data.startswith("overview_q:"))
 async def cb_overview_quiz(cb: CallbackQuery):
@@ -870,7 +875,7 @@ async def cb_overview_quiz(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("renameq_page:"), BuildStates.waiting_edit_quiz_title)
 async def cb_renameq_page(cb:CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(int(page), "renameq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "renameq"))
 
 @dp.callback_query(F.data.startswith("renameq:"), BuildStates.waiting_edit_quiz_title)
 async def cb_renameq_pick(cb:CallbackQuery, state:FSMContext):
@@ -891,7 +896,7 @@ async def cb_renameq_do(msg:Message, state:FSMContext):
 @dp.callback_query(F.data.startswith("delqz_page:"), BuildStates.waiting_pick_quiz_generic)
 async def cb_del_quiz_page(cb:CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(int(page), "delqz"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "delqz"))
 
 @dp.callback_query(F.data.startswith("delqz:"), BuildStates.waiting_pick_quiz_generic)
 async def cb_del_quiz_do(cb:CallbackQuery, state:FSMContext):
@@ -920,7 +925,7 @@ async def send_bundle_once(chat_id:int, quiz_id:int, bundle_id:int, expires_at:O
 @dp.callback_query(F.data.startswith("pub_pickq_page:"), PublishStates.waiting_pick_quiz)
 async def cb_pub_page(cb:CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(int(page), "pub_pickq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "pub_pickq"))
 
 @dp.callback_query(F.data.startswith("pub_pickq:"), PublishStates.waiting_pick_quiz)
 async def cb_pub_choose_duration(cb:CallbackQuery, state:FSMContext):
@@ -1160,7 +1165,7 @@ async def on_answer(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("score_pickq_page:"))
 async def cb_scoreboard_page(cb:CallbackQuery):
     _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(paged_quizzes_kb(int(page), "score_pickq"))
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "score_pickq"))
 
 @dp.callback_query(F.data.startswith("score_pickq:"))
 async def cb_scoreboard_show(cb:CallbackQuery):
