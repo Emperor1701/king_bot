@@ -35,7 +35,7 @@ from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ---------------------- ENV ----------------------
 load_dotenv()
@@ -407,7 +407,8 @@ def get_question_atts(question_id:int) -> List[sqlite3.Row]:
 
 def get_bundle_atts(bundle_id:int) -> List[sqlite3.Row]:
     with db() as conn:
-        rows = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",(bundle_id,)).fetchall()
+        rows = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",(bundle_id)).fetchall()
+
     return rows
 
 def question_card_text(qrow:sqlite3.Row) -> str:
@@ -962,72 +963,130 @@ async def cb_pub_custom_hours(msg:Message, state:FSMContext):
     dummy = Dummy(); dummy.message = msg; dummy.from_user = msg.from_user
     await _do_publish(dummy, quiz_id, expires_at); await state.clear()
 
+# ---- نشر متين لجميع الأسئلة بترتيب ID مع حماية من الأخطاء/الفلود ----
+RATE_LIMIT_SECONDS = 0.05  # مهلة قصيرة لتخفيف 429
+
+async def _safe_send(op, *args, **kwargs):
+    try:
+        msg = await op(*args, **kwargs)
+        await asyncio.sleep(RATE_LIMIT_SECONDS)
+        return msg
+    except TelegramRetryAfter as e:
+        wait = getattr(e, "retry_after", 1) or 1
+        print(f"[publish] FloodWait: sleeping {wait}s")
+        await asyncio.sleep(wait)
+        try:
+            msg = await op(*args, **kwargs)
+            await asyncio.sleep(RATE_LIMIT_SECONDS)
+            return msg
+        except Exception as e2:
+            print(f"[publish] failed after FloodWait retry: {e2}")
+            return None
+    except TelegramBadRequest as e:
+        print(f"[publish] BadRequest while sending: {e}")
+        return None
+    except Exception as e:
+        print(f"[publish] Unexpected send error: {e}")
+        return None
+
 async def _do_publish(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
     migrate_legacy_media()
     chat_id = cb_or_msg.message.chat.id
+
     with db() as conn:
-        quiz = conn.execute("SELECT * FROM quizzes WHERE id=? AND is_archived=0",(quiz_id,)).fetchone()
-        cnt = conn.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (quiz_id,)).fetchone()[0]
-    if not quiz or cnt == 0:
-        return await bot.send_message(chat_id, "اختبار غير صالح أو بلا أسئلة.")
-    exp_line = "بدون حدّ زمني" if not expires_at else f"حتى: <code>{expires_at}</code> (UTC)"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎓 ابدأ الحل", callback_data=f"start:{quiz_id}")]])
-    m = await bot.send_message(chat_id, f"📣 اختبار: <b>{quiz['title']}</b>\nالوقت: {exp_line}\nاضغطي زر \"ابدأ الحل\" لكتابة اسمك ثم أجيبي على الأسئلة.", reply_markup=kb)
-    with db() as conn:
-        conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                     (chat_id, quiz_id, m.message_id, expires_at))
-        conn.commit()
-    # send bundles first
-    with db() as conn:
-        used_bundle_ids = [r["media_bundle_id"] for r in conn.execute(
-            "SELECT DISTINCT media_bundle_id FROM questions WHERE quiz_id=? AND media_bundle_id IS NOT NULL ORDER BY media_bundle_id",
+        quiz = conn.execute(
+            "SELECT * FROM quizzes WHERE id=? AND is_archived=0",
             (quiz_id,)
-        ).fetchall()]
-    for b_id in used_bundle_ids:
-        await send_bundle_once(chat_id, quiz_id, b_id, expires_at)
+        ).fetchone()
+        qs = conn.execute(
+            "SELECT id, text, media_bundle_id FROM questions WHERE quiz_id=? ORDER BY id",
+            (quiz_id,)
+        ).fetchall()
+
+    if not quiz or not qs:
+        return await bot.send_message(chat_id, "اختبار غير صالح أو بلا أسئلة.")
+
+    exp_line = "بدون حدّ زمني" if not expires_at else f"حتى: <code>{expires_at}</code> (UTC)"
+    kb_start = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🎓 ابدأ الحل", callback_data=f"start:{quiz_id}")]]
+    )
+    m_head = await _safe_send(
+        bot.send_message,
+        chat_id,
+        f"📣 اختبار: <b>{quiz['title']}</b>\nالوقت: {exp_line}\nاضغطي زر \"ابدأ الحل\" لكتابة اسمك ثم أجيبي على الأسئلة.",
+        reply_markup=kb_start
+    )
+    if m_head:
         with db() as conn:
-            qs = conn.execute("SELECT id, text FROM questions WHERE quiz_id=? AND media_bundle_id=? ORDER BY id",
-                              (quiz_id, b_id)).fetchall()
-        for q in qs:
-            kbq = build_options_kb(q["id"], 0)
-            msg = await bot.send_message(chat_id, q["text"], reply_markup=kbq)
-            with db() as conn:
-                conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                             (chat_id, quiz_id, msg.message_id, expires_at))
-                conn.commit()
-    # other questions (attachments or none)
-    with db() as conn:
-        qs_other = conn.execute("SELECT id, text FROM questions WHERE quiz_id=? AND media_bundle_id IS NULL ORDER BY id", (quiz_id,)).fetchall()
-    for q in qs_other:
-        atts = get_question_atts(q["id"]); kbq = build_options_kb(q["id"], 0)
-        if atts:
+            conn.execute(
+                "INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
+                (chat_id, quiz_id, m_head.message_id, expires_at)
+            )
+            conn.commit()
+
+    sent_bundles = set()
+
+    for q in qs:
+        qid = q["id"]
+        qtext = q["text"]
+        bundle_id = q["media_bundle_id"]
+
+        # أنشر ملفات البوندل لمرة واحدة قبل أول سؤال يخصه
+        if bundle_id and bundle_id not in sent_bundles:
+            atts_bundle = get_bundle_atts(bundle_id)
+            for att in atts_bundle:
+                if att["kind"] == "photo":
+                    m = await _safe_send(bot.send_photo, chat_id, att["file_id"])
+                elif att["kind"] == "voice":
+                    m = await _safe_send(bot.send_voice, chat_id, att["file_id"])
+                else:
+                    m = await _safe_send(bot.send_audio, chat_id, att["file_id"])
+                if m:
+                    with db() as conn:
+                        conn.execute(
+                            "INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
+                            (chat_id, quiz_id, m.message_id, expires_at)
+                        )
+                        conn.commit()
+            sent_bundles.add(bundle_id)
+
+        kbq = build_options_kb(qid, 0)
+        atts_q = get_question_atts(qid)
+
+        if atts_q:
             first = True
-            for att in atts:
+            for att in atts_q:
                 if first:
                     if att["kind"] == "photo":
-                        msg = await bot.send_photo(chat_id, att["file_id"], caption=q["text"], reply_markup=kbq)
+                        m = await _safe_send(bot.send_photo, chat_id, att["file_id"], caption=qtext, reply_markup=kbq)
                     elif att["kind"] == "voice":
-                        msg = await bot.send_voice(chat_id, att["file_id"], caption=q["text"], reply_markup=kbq)
+                        m = await _safe_send(bot.send_voice, chat_id, att["file_id"], caption=qtext, reply_markup=kbq)
                     else:
-                        msg = await bot.send_audio(chat_id, att["file_id"], caption=q["text"], reply_markup=kbq)
+                        m = await _safe_send(bot.send_audio, chat_id, att["file_id"], caption=qtext, reply_markup=kbq)
                     first = False
                 else:
                     if att["kind"] == "photo":
-                        msg = await bot.send_photo(chat_id, att["file_id"])
+                        m = await _safe_send(bot.send_photo, chat_id, att["file_id"])
                     elif att["kind"] == "voice":
-                        msg = await bot.send_voice(chat_id, att["file_id"])
+                        m = await _safe_send(bot.send_voice, chat_id, att["file_id"])
                     else:
-                        msg = await bot.send_audio(chat_id, att["file_id"])
-                with db() as conn:
-                    conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                                 (chat_id, quiz_id, msg.message_id, expires_at))
-                    conn.commit()
+                        m = await _safe_send(bot.send_audio, chat_id, att["file_id"])
+                if m:
+                    with db() as conn:
+                        conn.execute(
+                            "INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
+                            (chat_id, quiz_id, m.message_id, expires_at)
+                        )
+                        conn.commit()
         else:
-            msg = await bot.send_message(chat_id, q["text"], reply_markup=kbq)
-            with db() as conn:
-                conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                             (chat_id, quiz_id, msg.message_id, expires_at))
-                conn.commit()
+            m = await _safe_send(bot.send_message, chat_id, qtext, reply_markup=kbq)
+            if m:
+                with db() as conn:
+                    conn.execute(
+                        "INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
+                        (chat_id, quiz_id, m.message_id, expires_at)
+                    )
+                    conn.commit()
 
 # ---------------------- Name & Answers ----------------------
 @dp.callback_query(F.data.startswith("start:"))
